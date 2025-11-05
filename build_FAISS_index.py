@@ -12,11 +12,10 @@ collection = client["rag_db"]["medical_dataset"]
 print("Connected to MongoDB and loading data...")
 
 # Load documents with their embeddings
-# We only load the first 20, as that's what we inserted
 docs_data = list(collection.find(
     {}, 
-    {"source_id": 1, "source_filename": 1, "chunk_index": 1, "chunk_embedding": 1, "chunk_text": 1} 
-).limit(100)) # Added limit(20) to match what we inserted
+    {"_id": 0, "source_filename": 1, "title": 1, "chunk_index": 1, "chunk_embedding": 1, "chunk_text": 1} 
+))
 
 print(f"Loaded {len(docs_data)} documents from MongoDB.")
 
@@ -26,9 +25,9 @@ for d in docs_data:
     doc = Document(
         page_content=d["chunk_text"],
         metadata={
-            "source_filename": d["source_filename"], # The filename, e.g., "article-29806.jsonl"
-            "source_id": d["source_id"],  # The original unique ID from the JSON
-            "chunk_index": d["chunk_index"] # The chunk number, e.g., 0, 1, 2...
+            "source_filename": d["source_filename"],
+            "title": d.get("title", "No Title"),
+            "chunk_index": d["chunk_index"]
         }
     )
     langchain_docs.append(doc)

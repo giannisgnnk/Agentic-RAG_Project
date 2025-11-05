@@ -13,7 +13,7 @@ QUESTIONS_TO_PROCESS = 20  # The total number of questions to process from the f
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 db = FAISS.load_local(faiss_index_path, embedding_model, allow_dangerous_deserialization=True)
 llm = OllamaLLM(model="llama3.2:1b")
-top_k = 5
+top_k = 3
 
 # --- 2. Helper Function for Parsing LLM Output ---
 def parse_llm_answer(llm_output, options_keys):
@@ -120,11 +120,12 @@ Answer:
     results = db.similarity_search(question, k=top_k)
     retrieved_docs = ""
     for rank, doc in enumerate(results, start=1):
-        doc_id = doc.metadata.get("doc_id", "Unknown")
-        chunk_id = doc.metadata.get("chunk_id", "Unknown")
-        source_id = doc.metadata.get("source_id", "Unknown")
+        source_file = doc.metadata.get("source_filename", "Unknown File")
+        title = doc.metadata.get("title", "No Title")
+        chunk_idx = doc.metadata.get("chunk_index", "Unknown")
         
-        retrieved_docs += f"\n\n[Doc {rank}] (File: {doc_id}, Chunk: {chunk_id}, Source ID: {source_id})\n"
+        retrieved_docs += f"\n\n[Doc {rank}] (Title: {title})\n"
+        retrieved_docs += f"(File: {source_file}, Chunk: {chunk_idx})\n"        
         retrieved_docs += doc.page_content[:500]
 
     prompt_with_context = f"""
