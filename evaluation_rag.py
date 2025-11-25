@@ -135,7 +135,6 @@ for i, qa_item in enumerate(questions_list, start=1):
     ]
 
     try:
-        # Call Ollama directly with format='json'
         response = chat(
             model='llama3:8b', 
             messages=messages_no_context, 
@@ -143,7 +142,7 @@ for i, qa_item in enumerate(questions_list, start=1):
             options={'temperature': 0.0}
         )
         
-        # Parse the JSON string into our Pydantic object
+        #parse the JSON string into our Pydantic object
         json_string = response['message']['content']
         pydantic_obj = parser.parse(json_string)
         parsed_no_context = pydantic_obj.answer
@@ -197,8 +196,7 @@ for i, qa_item in enumerate(questions_list, start=1):
     #print Result for this question
     print(f"  > RAG Answer:       {parsed_with_context} (Correct: {correct_answer}) -> {'CORRECT' if parsed_with_context == correct_answer else 'WRONG'}")
     print(f"  > No-Context Answer: {parsed_no_context} (Correct: {correct_answer}) -> {'CORRECT' if parsed_no_context == correct_answer else 'WRONG'}")
-    #if i % 10 == 0 or i == total_questions:
-    #     print(f"  ... (Current RAG Score: {rag_correct}/{i}) ...")
+
 
 print("\n========== EVALUATION COMPLETE ==========")
 print(f"Total Questions Processed: {total_questions}")
