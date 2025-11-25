@@ -4,27 +4,87 @@ import sys
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
+from unidecode import unidecode
+from langchain_ollama import ChatOllama # Changed to ChatOllama for better instruction following
+from pydantic import BaseModel, Field
+from typing import Literal
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 
 #setup
 faiss_index_path = "faiss_index"
 benchmark_file_path = "benchmark.json"
-QUESTIONS_TO_PROCESS = 20 
+QUESTIONS_TO_PROCESS = 20
 
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 db = FAISS.load_local(faiss_index_path, embedding_model, allow_dangerous_deserialization=True)
-llm = OllamaLLM(model="llama3.2:1b")
+#llm = OllamaLLM(model="llama3:8b", temperature=0.0)
+llm = ChatOllama(model="llama3:8b", temperature=0.0)
 top_k = 3
 
-#helper Function for Structured LLM Output
-def parse_llm_answer(llm_output, options_keys):
+
+# --- Pydantic Setup ---
+# Define the strict schema for the output
+class MultipleChoiceAnswer(BaseModel):
+    answer: Literal["A", "B", "C", "D"] = Field(description="The single letter (A, B, C, or D) of the correct option.")
+
+# Create the parser
+parser = PydanticOutputParser(pydantic_object=MultipleChoiceAnswer)
+
+# Get the automatic instructions (e.g., "You must return a JSON object...")
+format_instructions = parser.get_format_instructions()
+
+
+# --- NEW: The Cleaner Function ---
+def extract_json_str(message):
     """
-    Finds the first occurrence of a valid option key (e.g., 'A', 'B')
-    in the LLM's raw output.
+    Extracts the JSON string from the LLM output, ignoring chatty preambles.
     """
-    match = re.search(f"[{''.join(options_keys)}]", llm_output.strip().upper())
+    # Get text content from the AI Message
+    if hasattr(message, 'content'):
+        text = message.content
+    else:
+        text = str(message)
+        
+    # Find the first '{' and the last '}' (The JSON object)
+    match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         return match.group(0)
-    return None
+    
+    # If no JSON found, return original (parser will raise the standard error)
+    return text
+
+
+
+# --- Prompt Templates ---
+# Template A: No Context
+prompt_no_context = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful medical AI. Answer the user's multiple-choice question.\n{format_instructions}"),
+    ("human", "Question: {question}\n\nOptions:\n{options}\n\nAnswer:")
+])
+
+# Template B: With Context (RAG)
+prompt_with_context = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful medical AI. Use the provided context to answer the user's multiple-choice question.\n{format_instructions}"),
+    ("human", "Context:\n{context}\n\nQuestion: {question}\n\nOptions:\n{options}\n\nAnswer:")
+])
+
+# Create the Chains (Prompt -> LLM -> Parser)
+chain_no_context = prompt_no_context | llm | RunnableLambda(extract_json_str) | parser
+chain_with_context = prompt_with_context | llm | RunnableLambda(extract_json_str) | parser
+
+
+def clean_text(text):
+    """
+    Aggressively converts text to closest ASCII equivalent.
+    Fixes Cyrillic homoglyphs, fancy quotes, accents, etc.
+    """
+    if not isinstance(text, str):
+        return text
+    return unidecode(text)
+
+
 
 #load Benchmark
 questions_list = []
@@ -50,6 +110,11 @@ try:
                 stop_loading = True
                 break
             
+            qa_item["question"] = clean_text(qa_item["question"])
+            
+            raw_options = qa_item["options"]
+            qa_item["options"] = {k: clean_text(v) for k, v in raw_options.items()}
+
             #add section and q_id to the item for tracking
             qa_item['section'] = section_name
             qa_item['q_id'] = q_id
@@ -72,6 +137,9 @@ except FileNotFoundError:
 except json.JSONDecodeError:
     print(f"Error: Could not decode JSON from {benchmark_file_path}")
     sys.exit()
+
+
+
 
 #evaluation loop
 rag_correct = 0
@@ -97,49 +165,46 @@ for i, qa_item in enumerate(questions_list, start=1):
     for key, value in options.items():
         options_str += f"{key}: {value}\n"
     
-    #answer WITHOUT context
-    prompt_no_context = f"""
-Answer the following multiple-choice question by providing only the letter (A, B, C, or D) of the correct option.
-
-Question: {question}
-
-Options:
-{options_str}
-Answer:
-"""
-    answer_no_context_raw = llm.invoke(prompt_no_context)
-    parsed_no_context = parse_llm_answer(answer_no_context_raw, options.keys())
+    # --- Test A: No Context ---
+    try:
+        # Invoke the chain with the variables
+        response = chain_no_context.invoke({
+            "question": question,
+            "options": options_str,
+            "format_instructions": format_instructions
+        })
+        parsed_no_context = response.answer # We get a clean object back!
+    except Exception as e:
+        print(f"  > No-Context Error: {e}")
+        parsed_no_context = None
 
     if parsed_no_context == correct_answer:
         no_context_correct += 1
 
-    #answer WITH context (RAG)
+
+    # --- Test B: With Context (RAG) ---
     results = db.similarity_search(question, k=top_k)
     retrieved_docs = ""
     for rank, doc in enumerate(results, start=1):
-        source_file = doc.metadata.get("source_filename", "Unknown File")
         title = doc.metadata.get("title", "No Title")
+        source_file = doc.metadata.get("source_filename", "Unknown File")
         chunk_idx = doc.metadata.get("chunk_index", "Unknown")
         
-        retrieved_docs += f"\n\n[Doc {rank}] (Title: {title})\n"
-        retrieved_docs += f"(File: {source_file}, Chunk: {chunk_idx})\n"        
+        retrieved_docs += f"\n[Doc {rank}] (Title: {title}, File: {source_file})\n"
         retrieved_docs += doc.page_content[:500]
 
-    prompt_with_context = f"""
-You are an AI assistant. Use the provided context to answer the following multiple-choice question.
-Provide only the letter (A, B, C, or D) of the correct option.
-
-Context:
-{retrieved_docs}
-
-Question: {question}
-
-Options:
-{options_str}
-Answer:
-"""
-    answer_with_context_raw = llm.invoke(prompt_with_context)
-    parsed_with_context = parse_llm_answer(answer_with_context_raw, options.keys())
+    try:
+        # Invoke the RAG chain
+        response = chain_with_context.invoke({
+            "context": retrieved_docs,
+            "question": question,
+            "options": options_str,
+            "format_instructions": format_instructions
+        })
+        parsed_with_context = response.answer
+    except Exception as e:
+        print(f"  > RAG Error: {e}")
+        parsed_with_context = None
 
     if parsed_with_context == correct_answer:
         rag_correct += 1
