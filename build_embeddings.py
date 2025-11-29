@@ -11,7 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 #configuration
 JSON_FOLDER_PATH = "C:/Users/ggian/Desktop/Thesis_Project/MedRAG/corpus/statpearls/chunk"  
-FILES_TO_PROCESS = 80
+FILES_TO_PROCESS = 100
 
 
 #setup Embedding Model
@@ -20,7 +20,7 @@ embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-Mi
 
 
 #LLM for Agentic Chunker
-llm = OllamaLLM(model="llama3:8b")
+llm = OllamaLLM(model="llama3:8b", temperature=0.0)
 
 ########### Agentic Chunker Prompt #############
 #prompt to make the llm split the text in propositions and return them as a JSON list

@@ -7,7 +7,7 @@ from langchain.docstore import InMemoryDocstore
 
 #connect to MongoDB
 client = MongoClient("mongodb://localhost:27017")
-collection = client["rag_db"]["medical_dataset"]
+collection = client["rag_db"]["medical_dataset_without_splitter"]
 print("Connected to MongoDB and loading data...")
 
 #load documents with their embeddings
