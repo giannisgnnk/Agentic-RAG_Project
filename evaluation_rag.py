@@ -4,7 +4,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from unidecode import unidecode
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import Literal, List
 from langchain_core.output_parsers import PydanticOutputParser
 from ollama import chat
 
@@ -24,11 +24,19 @@ top_k = 3
 class MultipleChoiceAnswer(BaseModel):
     answer: Literal["A", "B", "C", "D"] = Field(description="The single letter (A, B, C, or D) of the correct option.")
 
+class RetrievedDoc(BaseModel):
+    doc: str = Field(description="The retrieved document chunk.")
+
+class AgenticRetrieval(BaseModel):
+    retrieved_docs: List[RetrievedDoc] = Field(description="A list of the top-k most relevant document chunks.")
+
 # Create the parser
 parser = PydanticOutputParser(pydantic_object=MultipleChoiceAnswer)
+agentic_retrieval_parser = PydanticOutputParser(pydantic_object=AgenticRetrieval)
 
 # Get the automatic instructions (e.g., "You must return a JSON object...")
 format_instructions = parser.get_format_instructions()
+agentic_retrieval_instructions = agentic_retrieval_parser.get_format_instructions()
 
 
 
@@ -156,12 +164,43 @@ for i, qa_item in enumerate(questions_list, start=1):
 
 
     # --- Test B: With Context (RAG) ---
-    results = db.similarity_search(question, k=top_k)
-    retrieved_docs = ""
+    # Agentic Retrieval
+    # 1. Perform an initial similarity search to get a smaller set of documents
+    initial_results = db.similarity_search(question, k=50)
+    initial_docs_text = [doc.page_content for doc in initial_results]
+
+    # 2. Pass the smaller set of documents to the agent for re-ranking
+    retrieval_messages = [
+        {
+            'role': 'system',
+            'content': f"You are a retriever agent. Your task is to find the {top_k} most relevant document chunks to the user's question from the provided list of documents.\n{agentic_retrieval_instructions}"
+        },
+        {
+            'role': 'user',
+            'content': f"Question: {question}\n\nDocuments:\n{initial_docs_text}"
+        }
+    ]
+
+    try:
+        response = chat(
+            model='llama3:8b',
+            messages=retrieval_messages,
+            format='json',
+            options={'temperature': 0.0}
+        )
+        
+        json_string = response['message']['content']
+        pydantic_obj = agentic_retrieval_parser.parse(json_string)
+        results = pydantic_obj.retrieved_docs
+
+    except Exception as e:
+        print(f"  > Agentic Retrieval Error: {e}")
+        results = []
+
+    retrieved_docs_str = ""
     for rank, doc in enumerate(results, start=1):
-        title = doc.metadata.get("title", "No Title")
-        source_file = doc.metadata.get("source_filename", "Unknown File")
-        retrieved_docs += f"\n[Doc {rank}] (Title: {title}, File: {source_file})\n{doc.page_content[:500]}"
+        # We don't have metadata here, so we just show the doc
+        retrieved_docs_str += f"\n[Doc {rank}]\n{doc.doc[:500]}"
 
     messages_with_context = [
         {
@@ -170,7 +209,7 @@ for i, qa_item in enumerate(questions_list, start=1):
         },
         {
             'role': 'user', 
-            'content': f"Context:\n{retrieved_docs}\n\nQuestion: {question}\n\nOptions:\n{options_str}\n\nAnswer:"
+            'content': f"Context:\n{retrieved_docs_str}\n\nQuestion: {question}\n\nOptions:\n{options_str}\n\nAnswer:"
         }
     ]
 
