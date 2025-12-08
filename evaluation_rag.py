@@ -8,38 +8,46 @@ from typing import Literal, List
 from langchain_core.output_parsers import PydanticOutputParser
 from ollama import chat
 
-#setup
+# --- Setup ---
 faiss_index_path = "faiss_index"
 benchmark_file_path = "benchmark.json"
 QUESTIONS_TO_PROCESS = 20
 
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 db = FAISS.load_local(faiss_index_path, embedding_model, allow_dangerous_deserialization=True)
-
 top_k = 3
 
 
-# --- Pydantic Setup ---
-# Define the strict schema for the output
+# --- Pydantic Models ---
+
+#for final answer
 class MultipleChoiceAnswer(BaseModel):
     answer: Literal["A", "B", "C", "D"] = Field(description="The single letter (A, B, C, or D) of the correct option.")
 
+#for agentic retrieval output
 class RetrievedDoc(BaseModel):
     doc: str = Field(description="The retrieved document chunk.")
 
 class AgenticRetrieval(BaseModel):
     retrieved_docs: List[RetrievedDoc] = Field(description="A list of the top-k most relevant document chunks.")
 
-# Create the parser
+#for planning
+class QueryPlan(BaseModel):
+    sub_queries: List[str] = Field(description="A list of 2-3 simple, keyword-based search queries to gather necessary information.")
+
+
+#Parsers
 parser = PydanticOutputParser(pydantic_object=MultipleChoiceAnswer)
 agentic_retrieval_parser = PydanticOutputParser(pydantic_object=AgenticRetrieval)
+planning_parser = PydanticOutputParser(pydantic_object=QueryPlan)
 
-# Get the automatic instructions (e.g., "You must return a JSON object...")
+
+#Get the automatic instructions (e.g., "You must return a JSON object...")
 format_instructions = parser.get_format_instructions()
 agentic_retrieval_instructions = agentic_retrieval_parser.get_format_instructions()
+planning_instructions = planning_parser.get_format_instructions()
 
-
-
+#helper function to clean text from benchmark
 def clean_text(text):
     """
     Aggressively converts text to closest ASCII equivalent.
@@ -51,7 +59,8 @@ def clean_text(text):
 
 
 
-#load Benchmark
+# --- Load Benchmark ---
+
 questions_list = []
 total_loaded = 0
 
@@ -106,7 +115,7 @@ except json.JSONDecodeError:
 
 
 
-#evaluation loop
+# --- Evaluation loop ----
 rag_correct = 0
 no_context_correct = 0
 
@@ -164,12 +173,42 @@ for i, qa_item in enumerate(questions_list, start=1):
 
 
     # --- Test B: With Context (RAG) ---
-    # Agentic Retrieval
-    # 1. Perform an initial similarity search to get a smaller set of documents
-    initial_results = db.similarity_search(question, k=50)
+    #PHASE 1: AGENTIC PLANNING
+    plan_messages = [
+        {
+            'role': 'system',
+            'content': f"You are an expert researcher. Break down the user's complex medical question into simple keyword search queries.\n{planning_instructions}"
+        },
+        {
+            'role': 'user',
+            'content': f"Question: {question}\nOptions:\n{options_str}"
+        }
+    ]
+
+    search_queries = [question] # Always include the original question
+    try:
+        response = chat(model='llama3:8b', messages=plan_messages, format='json', options={'temperature': 0.0})
+        plan = planning_parser.parse(response['message']['content'])
+        search_queries.extend(plan.sub_queries)
+    except Exception as e:
+        print(f"  > Planning Failed (Using original query only): {e}")
+
+    #PHASE 2: MULTI-QUERY SEARCH (Gathering)
+    unique_docs = {}
+    
+    for query in search_queries:
+        # We fetch a few docs for each sub-query
+        docs = db.similarity_search(query, k=15) 
+        for doc in docs:
+            # Deduplicate based on content
+            if doc.page_content not in unique_docs:
+                unique_docs[doc.page_content] = doc
+    
+    # Collect all unique docs and limit to 50 (as per your original script logic)
+    initial_results = list(unique_docs.values())[:50]
     initial_docs_text = [doc.page_content for doc in initial_results]
 
-    # 2. Pass the smaller set of documents to the agent for re-ranking
+    #PHASE 3: AGENTIC RETRIEVAL
     retrieval_messages = [
         {
             'role': 'system',
@@ -199,7 +238,6 @@ for i, qa_item in enumerate(questions_list, start=1):
 
     retrieved_docs_str = ""
     for rank, doc in enumerate(results, start=1):
-        # We don't have metadata here, so we just show the doc
         retrieved_docs_str += f"\n[Doc {rank}]\n{doc.doc[:500]}"
 
     messages_with_context = [
