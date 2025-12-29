@@ -1,11 +1,13 @@
 import csv
 import json
+import random
+import re
 import sys
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from unidecode import unidecode
-from pydantic import BaseModel, Field
-from typing import Literal, List
+from pydantic import BaseModel, Field, model_validator
+from typing import Literal, List, Any
 from langchain_core.output_parsers import PydanticOutputParser
 from ollama import chat
 
@@ -13,7 +15,7 @@ from ollama import chat
 
 faiss_index_path = "faiss_index"  # Path to the FAISS vector store
 benchmark_file_path = "benchmark.json"  # Path to the evaluation questions
-QUESTIONS_TO_PROCESS = 20  
+QUESTIONS_TO_PROCESS = 150
 
 # Initialize the embedding model from HuggingFace
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -31,6 +33,52 @@ top_k = 3
 # Defines the structure for a multiple-choice answer
 class MultipleChoiceAnswer(BaseModel):
     answer: Literal["A", "B", "C", "D"] = Field(description="The single letter (A, B, C, or D) of the correct option.")
+    justification: str = Field(description="A brief justification for why the chosen answer is correct.")
+
+    @model_validator(mode='before')
+    @classmethod
+    def preprocess_input(cls, data: Any) -> Any:
+        # 1. Ensure data is a dict
+        if not isinstance(data, dict):
+            return data
+
+        # 2. Unwrap 'properties' if present (Fixes the nesting issue)
+        if 'properties' in data and isinstance(data['properties'], dict):
+            data = data['properties']
+
+        # 3. Handle Case Sensitivity
+        if 'Justification' in data and 'justification' not in data:
+            data['justification'] = data.pop('Justification')
+        if 'Answer' in data and 'answer' not in data:
+            data['answer'] = data.pop('Answer')
+        
+        # 4. SAFETY NET: Handle "Not Applicable", "None", or invalid answers
+        # Αυτό είναι το κομμάτι που αποτρέπει το crash!
+        valid_options = ["A", "B", "C", "D"]
+        current_ans = str(data.get('answer', '')).strip().upper()
+        
+        # Προσπάθεια να βρούμε γράμμα αν υπάρχει (π.χ. "Option A" -> "A")
+        match = re.search(r'\b([A-D])\b', current_ans)
+        
+        if match:
+            # Αν βρήκαμε γράμμα μέσα στο κείμενο, το κρατάμε
+            data['answer'] = match.group(1)
+        elif current_ans not in valid_options:
+            # Αν η απάντηση είναι τελείως άκυρη (π.χ. "NOT APPLICABLE"), διαλέγουμε τυχαία!
+            fallback = random.choice(valid_options)
+            print(f"  > [Warning] Invalid LLM Answer: '{current_ans}'. Falling back to random choice: '{fallback}'")
+            
+            data['answer'] = fallback
+            data['justification'] = f"[SYSTEM RECOVERY] Model replied '{current_ans}'. Forced fallback to '{fallback}'. Original justification: " + str(data.get('justification', ''))
+
+        return data
+
+# --- JUDGE AGENT STRUCTURE ---
+class JudgeVerdict(BaseModel):
+    rag_logic_score: int = Field(description="Score 1-10 for the RAG model's reasoning quality.")
+    llm_logic_score: int = Field(description="Score 1-10 for the No-Context LLM's reasoning quality.")
+    winner: Literal["RAG", "LLM", "TIE"] = Field(description="Which model had better reasoning?")
+    critique: str = Field(description="Brief explanation of why one was better than the other.")
 
 # Defines the structure for a single retrieved document chunk
 class RetrievedDoc(BaseModel):
@@ -71,6 +119,50 @@ def clean_text(text):
     return unidecode(text)
 
 
+def evaluate_reasoning(question, correct_opt, llm_ans, llm_just, rag_ans, rag_just):
+    """
+    Acts as a Judge Agent to compare the reasoning of No-Context vs RAG.
+    """
+    judge_prompt = f"""You are an impartial Medical Expert Evaluator (Judge).
+
+    TASK:
+    Compare the reasoning (justification) of two AI models answering a medical question.
+    
+    DATA:
+    - Question: {question}
+    - Correct Answer: {correct_opt}
+    
+    - Model A (No Context): Answered {llm_ans}.
+      Reasoning: "{llm_just}"
+      
+    - Model B (RAG + Context): Answered {rag_ans}.
+      Reasoning: "{rag_just}"
+    
+    CRITERIA:
+    1. FACTUALITY: Does the reasoning align with the correct medical answer?
+    2. COHERENCE: Is the logic sound and step-by-step?
+    3. HALLUCINATION CHECK: Did Model B force irrelevant context into the answer?
+
+    OUTPUT:
+    Return a JSON with:
+    - Scores (1-10) for both.
+    - Winner ("RAG", "LLM", or "TIE").
+    - A short critique explaining the verdict.
+    """
+
+    try:
+        response = chat(
+            model='llama3:8b',
+            messages=[{'role': 'system', 'content': judge_prompt}],
+            format=JudgeVerdict.model_json_schema(), # Χρήση του schema για δομημένη έξοδο
+            options={'temperature': 0.0}
+        )
+        return JudgeVerdict.model_validate_json(response['message']['content'])
+    except Exception as e:
+        print(f"  > Judge Error: {e}")
+        # Fallback σε περίπτωση λάθους
+        return JudgeVerdict(rag_logic_score=0, llm_logic_score=0, winner="TIE", critique="Error in Judge")
+
 
 # --- Load Benchmark Data ---
 
@@ -84,7 +176,7 @@ try:
 
     print(f"Loading benchmark from {benchmark_file_path}...")
     
-    stop_loading = False
+    all_questions = []
     # Iterate through the top-level sections of the benchmark (e.g., "medqa")
     for section_name, section_questions in benchmark_data.items():
         if not isinstance(section_questions, dict):
@@ -93,11 +185,6 @@ try:
         
         # Iterate through each question-answer item in the section
         for q_id, qa_item in section_questions.items():
-            # Stop loading if we have reached the desired number of questions
-            if len(questions_list) >= QUESTIONS_TO_PROCESS:
-                stop_loading = True
-                break
-            
             # Clean the text of the question and options
             qa_item["question"] = clean_text(qa_item["question"])
             raw_options = qa_item["options"]
@@ -106,10 +193,13 @@ try:
             # Add metadata (section and question ID) to the item for tracking
             qa_item['section'] = section_name
             qa_item['q_id'] = q_id
-            questions_list.append(qa_item)
-        
-        if stop_loading:
-            break  # Stop the outer loop as well
+            all_questions.append(qa_item)
+
+    # Now, if QUESTIONS_TO_PROCESS is less than total questions, get a random sample
+    if len(all_questions) > QUESTIONS_TO_PROCESS:
+        questions_list = random.sample(all_questions, QUESTIONS_TO_PROCESS)
+    else:
+        questions_list = all_questions
             
     total_questions = len(questions_list)
     
@@ -161,7 +251,7 @@ for i, qa_item in enumerate(questions_list, start=1):
     messages_no_context = [
         {
             'role': 'system', 
-            'content': f"You are a helpful medical AI. Answer the user's multiple-choice question.\n{format_instructions}"
+            'content': f"You are a helpful medical AI. Answer the user's multiple-choice question and provide a justification for your choice.\n{format_instructions}"
         },
         {
             'role': 'user', 
@@ -182,10 +272,12 @@ for i, qa_item in enumerate(questions_list, start=1):
         json_string = response['message']['content']
         pydantic_obj = parser.parse(json_string)
         parsed_no_context = pydantic_obj.answer
+        justification_no_context = pydantic_obj.justification
 
     except Exception as e:
         print(f"  > No-Context Error: {e}")
         parsed_no_context = None
+        justification_no_context = None
 
     # Check if the baseline answer is correct
     if parsed_no_context == correct_answer:
@@ -224,7 +316,7 @@ for i, qa_item in enumerate(questions_list, start=1):
     
     for query in search_queries:
         # Fetch a large number of docs for each sub-query to create a rich initial pool
-        docs = db.similarity_search(query, k=15) 
+        docs = db.similarity_search(query, k=7) 
         for doc in docs:
             content = doc.page_content
             
@@ -242,9 +334,11 @@ for i, qa_item in enumerate(questions_list, start=1):
                 existing_doc = unique_docs[content]
                 if query not in existing_doc.metadata['source_queries']:
                     existing_doc.metadata['source_queries'].append(query)
+
     
-    # Collect all unique docs and limit the pool to 50 to manage context size
-    initial_results = list(unique_docs.values())[:50]
+    # Convert dictionary to list and get top 50 candidates
+    all_candidates = list(unique_docs.values())
+    initial_results = all_candidates[:50]
     initial_docs_text = [doc.page_content for doc in initial_results]
 
     # PHASE 3: AGENTIC RETRIEVAL (RE-RANKING)
@@ -285,10 +379,37 @@ for i, qa_item in enumerate(questions_list, start=1):
 
     # PHASE 4: ANSWERING WITH CONTEXT
     # The LLM answers the question using the refined context from the RAG process.
+    
+    system_prompt_cot = f"""You are an expert medical AI utilizing retrieval-augmented generation.
+
+TASK:
+Answer the multiple-choice question using the provided Context Documents AND your own expert medical knowledge.
+
+CRITICAL INSTRUCTION - RELEVANCE CHECK:
+Before answering, evaluate if the Context Documents are ACTUALLY related to the specific medical topic of the question.
+- IF Context is Irrelevant (e.g., talks about "Physical Therapy" while the question is about "Dentistry"): **DISCARD the Context completely** and answer solely based on your internal knowledge.
+- IF Context is Relevant: Use it to support your answer and clarify specific details.
+
+INSTRUCTIONS:
+1. ANALYZE: Read the context documents carefully.
+2. CHECK RELEVANCE: Explicitly ask yourself: "Do these documents discuss the exact same pathology/condition as the question?"
+3. SYNTHESIZE: Combine valid context facts with your internal medical expertise.
+4. THINK STEP-BY-STEP: Compare the medical facts against options A, B, C, and D.
+5. ELIMINATE: Rule out options that are incorrect based on the valid evidence.
+6. FORCE SELECTION: You MUST select the most plausible option (A, B, C, or D).
+   - Do NOT answer "Not Applicable".
+   - Do NOT answer "None".
+   - If unsure, pick the best educated guess based on general medical principles.
+
+OUTPUT FORMAT:
+You must return a valid JSON object strictly following this schema:
+{format_instructions}
+"""
+
     messages_with_context = [
         {
             'role': 'system', 
-            'content': f"You are a helpful medical AI. Use the provided context to answer the user's multiple-choice question.\n{format_instructions}"
+            'content': system_prompt_cot
         },
         {
             'role': 'user', 
@@ -307,21 +428,34 @@ for i, qa_item in enumerate(questions_list, start=1):
         json_string = response['message']['content']
         pydantic_obj = parser.parse(json_string)
         parsed_with_context = pydantic_obj.answer
+        justification_with_context = pydantic_obj.justification
 
     except Exception as e:
         print(f"  > RAG Error: {e}")
         parsed_with_context = None
+        justification_with_context = None
 
     # Check if the RAG answer is correct
     if parsed_with_context == correct_answer:
         rag_correct += 1
     
-    # Print the comparison for this question
+   # Print the comparison for this question
     print(f"  > RAG Answer:       {parsed_with_context} (Correct: {correct_answer}) -> {'CORRECT' if parsed_with_context == correct_answer else 'WRONG'}")
     print(f"  > No-Context Answer: {parsed_no_context} (Correct: {correct_answer}) -> {'CORRECT' if parsed_no_context == correct_answer else 'WRONG'}")
 
+    # --- NEW: JUDGE AGENT CALL ---
+    print("  > Judge Agent is deliberating...")
+    verdict = evaluate_reasoning(
+        question=question,
+        correct_opt=correct_answer,
+        llm_ans=parsed_no_context,
+        llm_just=justification_no_context,
+        rag_ans=parsed_with_context,
+        rag_just=justification_with_context
+    )
+    # -----------------------------
+
     # --- Ground Truth Comparison & Status ---
-    # Determine the outcome: did RAG help, harm, or make no difference?
     status = "UNKNOWN"
     is_llm_correct = (parsed_no_context == correct_answer)
     is_rag_correct = (parsed_with_context == correct_answer)
@@ -340,63 +474,62 @@ for i, qa_item in enumerate(questions_list, start=1):
     # --- Store Detailed Results for CSV Export ---
     result_row = {
         "id": q_id,
-        "question": question[:50] + "...", # Store a preview for reference
+        "question": question[:50] + "...",
         "correct": correct_answer,
         "llm_ans": parsed_no_context,
         "rag_ans": parsed_with_context,
         "status": status,
+        "llm_justification": justification_no_context,
+        "rag_justification": justification_with_context,
+        
+        # --- NEW: JUDGE DATA ---
+        "judge_winner": verdict.winner,
+        "rag_score": verdict.rag_logic_score,
+        "llm_score": verdict.llm_logic_score,
+        "judge_critique": verdict.critique
     }
     detailed_results.append(result_row)
 
-    # --- Detailed Logging for Retrieval Analysis ---
-    # This section writes a detailed log for each retrieved document to a JSONL file, allowing for in-depth analysis of the retrieval process.
+    # ***JSON FILE*** --- Detailed Logging for Retrieval Analysis --- 
     try:
         json_filename = "rag_retrieval_logs_detailed1.jsonl"
-        
         with open(json_filename, mode='a', encoding='utf-8') as file:
-            # Iterate through the final re-ranked documents
             for rank, doc_item in enumerate(results, start=1):
                 doc_content = doc_item.doc if hasattr(doc_item, 'doc') else doc_item
-                # Find the original document object to access its metadata
                 original_doc = unique_docs.get(doc_content)
-                
-                # Retrieve all the queries that found this document
                 all_sources = original_doc.metadata.get('source_queries', []) if original_doc else []
                 
-                # --- Source Analysis (Original vs. Planner) ---
-                # Check if the original question was one of the sources
+                # --- Source Analysis ---
                 found_by_original = any(src.strip() == question.strip() for src in all_sources)
-                
-                # Find which sub-queries (from the planner) found the doc
                 planner_matches = [src for src in all_sources if src.strip() != question.strip()]
                 found_by_planner = len(planner_matches) > 0
                 
-                # --- Prepare Log Entry ---
-                # Clean up text for a clean preview in the log
-                q_preview = (question.replace('\n', ' ').replace('\r', '')[:100] + "...")
-                doc_preview = (doc_content.replace('\n', ' ').replace('\r', '')[:150] + "...")
+                # --- FORMATTING ---
+                clean_q = question.replace('\n', ' ').replace('\r', '').strip()
+                if len(clean_q) > 150:
+                    q_preview = clean_q[:147] + "..."
+                else:
+                    q_preview = clean_q 
+
+                full_doc_content = str(doc_content).replace('\n', ' ').replace('\r', '').strip()
 
                 log_entry = {
+                    "question_id": str(q_id),
                     "question_preview": q_preview,
-                    "rank": rank, # Final rank after re-ranking
+                    "rank": rank,
                     "source_analysis": {
                         "found_by_original": found_by_original,
                         "found_by_planner": found_by_planner,
                         "planner_queries_count": len(planner_matches)
                     },
-                    "match_score": len(all_sources), # Total number of queries that hit this doc
-                    "all_matching_queries": all_sources, # Full list of matching queries
-                    "doc_preview": doc_preview
+                    "match_score": len(all_sources),
+                    "all_matching_queries": all_sources,
+                    "doc_content": full_doc_content 
                 }
-                
-                # Write the log entry as a new line in the JSONL file
                 file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-                
         print(f"Detailed logs saved to {json_filename}")
-
     except Exception as e:
         print(f"Error saving JSON logs: {e}")
-
 
 # --- Final Results Summary ---
 print("\n========== EVALUATION COMPLETE ==========")
@@ -418,15 +551,64 @@ print("\n--- Improvement ---")
 improvement = rag_accuracy - no_context_accuracy
 print(f"RAG system accuracy change: {improvement:+.2f}%.")
 
-# --- Export Summary Results to CSV ---
+
+# ***CSV FILE*** --- Export Summary Results ---
 output_filename = "rag_evaluation_results1.csv"
+
 if detailed_results:
-    keys = detailed_results[0].keys()
+    # 1. Sort by Priority
+    status_priority = {
+        "RAG_WORSENED": 0, "RAG_IMPROVED": 1, "BOTH_WRONG": 2, "BOTH_CORRECT": 3
+    }
+    detailed_results.sort(key=lambda x: status_priority.get(x["status"], 99))
+
+    # 2. Define CSV Columns (UPDATED WITH JUDGE FIELDS)
+    fieldnames = [
+        "id", "status", "correct", "llm_ans", "rag_ans", 
+        "judge_winner", "rag_score", "llm_score",  # <--- NEW
+        "question", "judge_critique",              # <--- NEW
+        "llm_justification", "rag_justification"
+    ]
+
+    # 3. Calculate Max Widths
+    max_w_q = 20
+    max_w_critique = 20 # <--- NEW
+
+    for row in detailed_results:
+        q_text = str(row.get("question", "")).replace("\n", " ").strip()
+        c_text = str(row.get("judge_critique", "")).replace("\n", " ").strip() # <--- NEW
+
+        if len(q_text) > max_w_q: max_w_q = len(q_text)
+        if len(c_text) > max_w_critique: max_w_critique = len(c_text)
+
+    # Cap max width to avoid massive files
+    max_w_q = min(max_w_q + 5, 100)
+    max_w_critique = min(max_w_critique + 5, 150)
+
+    # 4. Write to CSV
     with open(output_filename, 'w', newline='', encoding='utf-8') as output_file:
-        dict_writer = csv.DictWriter(output_file, fieldnames=keys)
+        dict_writer = csv.DictWriter(output_file, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
         dict_writer.writeheader()
-        dict_writer.writerows(detailed_results)
-    print(f"\nDetailed results saved to '{output_filename}'. Open this to analyze specific questions.")
+        
+        for row in detailed_results:
+            clean_row = row.copy()
+            
+            def pad_text(text, width):
+                if text is None: return "".ljust(width)
+                clean = str(text).replace("\n", " ").replace("\r", "").strip()
+                return clean.ljust(width)
+
+            # Apply Padding
+            clean_row["question"] = pad_text(clean_row["question"], max_w_q)
+            clean_row["judge_critique"] = pad_text(clean_row.get("judge_critique", ""), max_w_critique) # <--- NEW
+            
+            # Align smaller fields
+            clean_row["id"] = str(clean_row["id"]).strip().ljust(38)
+            clean_row["status"] = str(clean_row["status"]).strip().ljust(15)
+            clean_row["judge_winner"] = str(clean_row.get("judge_winner", "")).strip().center(10) # <--- NEW
+            
+            dict_writer.writerow(clean_row)
+            
+    print(f"\nResults saved to '{output_filename}'.")
 else:
     print("\nNo results to save to CSV.")
-

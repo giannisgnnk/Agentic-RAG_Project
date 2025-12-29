@@ -10,7 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 #configuration
-JSON_FOLDER_PATH = "C:/Users/ggian/Desktop/Thesis_Project/MedRAG/corpus/statpearls/chunk"  
+JSON_FOLDER_PATH = "C:/Users/ggian/Desktop/Agentic-RAG_Project/MedRAG/corpus/statpearls/chunk"  
 FILES_TO_PROCESS = 100
 
 
