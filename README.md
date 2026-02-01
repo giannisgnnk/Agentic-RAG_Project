@@ -28,3 +28,15 @@ This project presents the implementation of an advanced Retrieval-Augmented Gene
 
 ## 📌Note
 ⚠️ Remember to change the paths in the scripts to your local path where the required files are saved.
+
+## 🛠️Tech stack
+⚙️	**Orchestration:** LangChain is used to manage the flow between the different agents and tools.
+
+⚙️	**LLM Inference:** Ollama runs the Llama-3 model locally, which helps with data privacy and speed.
+
+⚙️	**Document Store:** MongoDB is used to store the textual content of the generated chunks, serving as the system's primary knowledge base.
+
+⚙️	**Vector Database:** FAISS is used for efficient storage and retrieval of the text vectors.
+
+⚙️	**Embeddings:** Sentence-Transformers handles the conversion of text into vectors.
+
