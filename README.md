@@ -1,7 +1,7 @@
 # Agentic - RAG Architecture 
 
 ## 🧠Info
-This project presents the implementation of an advanced Retrieval-Augmented Generation (RAG) system optimized for the medical domain, aiming to enhance the accuracy and reasoning capabilities of Large Language Models (LLMs) in answering complex clinical questions.
+This project presents the implementation of an advanced, fully agentic, Retrieval-Augmented Generation (RAG) system optimized for the medical domain, aiming to enhance the accuracy and reasoning capabilities of Large Language Models (LLMs) in answering complex clinical questions.
 
 ✅ The system introduces a specialized data processing pipeline that utilizes an "Agentic Chunker" powered by Llama-3 to decompose medical texts from the StatPearls corpus into semantically complete propositions (chunks).
       
